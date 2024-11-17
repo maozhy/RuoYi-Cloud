@@ -1,29 +1,50 @@
 package com.ruoyi.gateway.filter;
 
+import com.alibaba.fastjson2.JSONObject;
+import com.ruoyi.common.core.constant.CacheConstants;
+import com.ruoyi.common.core.constant.HttpStatus;
+import com.ruoyi.common.core.constant.SecurityConstants;
+import com.ruoyi.common.core.constant.TokenConstants;
+import com.ruoyi.common.core.exception.ServiceException;
+import com.ruoyi.common.core.utils.JwtUtils;
+import com.ruoyi.common.core.utils.ServletUtils;
+import com.ruoyi.common.core.utils.StringUtils;
+import com.ruoyi.common.redis.service.RedisService;
+import com.ruoyi.gateway.config.properties.IgnoreWhiteProperties;
+import com.ruoyi.gateway.config.properties.OpenApiProperties;
+import com.ruoyi.gateway.domain.OpenApiAclHeaders;
+import io.jsonwebtoken.Claims;
+import org.apache.commons.codec.binary.Base64;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
 import org.springframework.cloud.gateway.filter.GlobalFilter;
 import org.springframework.core.Ordered;
+import org.springframework.core.io.buffer.DataBuffer;
+import org.springframework.core.io.buffer.DataBufferUtils;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.codec.HttpMessageReader;
 import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.http.server.reactive.ServerHttpRequestDecorator;
 import org.springframework.stereotype.Component;
+import org.springframework.util.MultiValueMap;
+import org.springframework.web.reactive.function.server.HandlerStrategies;
+import org.springframework.web.reactive.function.server.ServerRequest;
 import org.springframework.web.server.ServerWebExchange;
-import com.ruoyi.common.core.constant.CacheConstants;
-import com.ruoyi.common.core.constant.HttpStatus;
-import com.ruoyi.common.core.constant.SecurityConstants;
-import com.ruoyi.common.core.constant.TokenConstants;
-import com.ruoyi.common.core.utils.JwtUtils;
-import com.ruoyi.common.core.utils.ServletUtils;
-import com.ruoyi.common.core.utils.StringUtils;
-import com.ruoyi.common.redis.service.RedisService;
-import com.ruoyi.gateway.config.properties.IgnoreWhiteProperties;
-import io.jsonwebtoken.Claims;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import java.security.MessageDigest;
+import java.util.HashMap;
+import java.util.List;
+import java.util.TreeMap;
 
 /**
  * 网关鉴权
- * 
+ *
  * @author ruoyi
  */
 @Component
@@ -38,6 +59,9 @@ public class AuthFilter implements GlobalFilter, Ordered
     @Autowired
     private RedisService redisService;
 
+    @Autowired
+    private OpenApiProperties openApi;
+
 
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain)
@@ -50,6 +74,9 @@ public class AuthFilter implements GlobalFilter, Ordered
         if (StringUtils.matches(url, ignoreWhite.getWhites()))
         {
             return chain.filter(exchange);
+        }
+        if (StringUtils.matches(url, openApi.getApis())) {
+            return openApiAcl(exchange, chain);
         }
         String token = getToken(request);
         if (StringUtils.isEmpty(token))
@@ -131,5 +158,141 @@ public class AuthFilter implements GlobalFilter, Ordered
     public int getOrder()
     {
         return -200;
+    }
+
+    private static final List<HttpMessageReader<?>> messageReaders = HandlerStrategies.withDefaults().messageReaders();
+
+    private Mono<Void> openApiAcl(ServerWebExchange exchange, GatewayFilterChain chain) {
+        ServerHttpRequest request = exchange.getRequest();
+        OpenApiAclHeaders acl = getAclHeaders(request.getHeaders());
+        if (StringUtils.isEmpty(acl.getAccesskey())) {
+            return unauthorizedResponse(exchange, "缺少accessKey");
+        }
+        HashMap<String, String> map = redisService.getCacheObject("openapi:acl:" + acl.getAccesskey());
+        if (map == null) {
+            return unauthorizedResponse(exchange, "无效的accessKey");
+        }
+        if (StringUtils.isEmpty(map.get("status")) || !map.get("status").equals("0")) {
+            return unauthorizedResponse(exchange, "accessKey状态异常");
+        }
+
+        if (request.getMethodValue().equals("POST")) {
+            return DataBufferUtils.join(request.getBody()).defaultIfEmpty(exchange.getResponse().bufferFactory().allocateBuffer(0)).flatMap(dataBuffer -> {
+                if (dataBuffer.readableByteCount() == 0) {
+                    DataBufferUtils.release(dataBuffer);
+                    String contentmd5 = toMD5Base64("");
+                    if (!contentmd5.equals(acl.getContentmd5())) {
+                        return unauthorizedResponse(exchange, "conmentmd5校验失败");
+                    }
+                    if (!calculateHMAC(map.get("secretKey"), contentmd5 + "\n" + acl.getRequestdate()).equals(acl.getHmac())) {
+                        return unauthorizedResponse(exchange, "hmac校验失败");
+                    }
+                    ServerHttpRequest.Builder mutate = request.mutate();
+                    addHeader(mutate, SecurityConstants.USER_KEY, map.get("accessKey"));
+                    addHeader(mutate, SecurityConstants.DETAILS_USER_ID, map.get("id"));
+                    addHeader(mutate, SecurityConstants.DETAILS_USERNAME, map.get("name"));
+                    return chain.filter(exchange.mutate().request(mutate.build()).build());
+                } else {
+                    byte[] bytes = new byte[dataBuffer.readableByteCount()];
+                    dataBuffer.read(bytes);
+                    DataBufferUtils.release(dataBuffer);
+                    TreeMap treeMap = JSONObject.parseObject(new String(bytes), TreeMap.class);
+                    StringBuilder content = new StringBuilder();
+                    treeMap.forEach((k, v) -> {
+                        log.info(v.toString());
+                        content.append(v).append("\n");
+                    });
+                    content.delete(content.length() - 1, content.length());
+                    String contentmd5 = toMD5Base64(content.toString());
+                    if (!contentmd5.equals(acl.getContentmd5())) {
+                        return unauthorizedResponse(exchange, "conmentmd5校验失败");
+                    }
+                    if (!calculateHMAC(map.get("secretKey"), contentmd5 + "\n" + acl.getRequestdate()).equals(acl.getHmac())) {
+                        return unauthorizedResponse(exchange, "hmac校验失败");
+                    }
+                    ServerHttpRequestDecorator mutatedRequest = new ServerHttpRequestDecorator(request) {
+                        @Override
+                        public Flux<DataBuffer> getBody() {
+                            return Flux.defer(() -> {
+                                DataBuffer buffer = exchange.getResponse().bufferFactory().wrap(bytes);
+                                DataBufferUtils.retain(buffer);
+                                return Mono.just(buffer).doFinally(signalType -> {
+                                    DataBufferUtils.release(buffer);
+                                });
+                            });
+                        }
+                    };
+                    ServerHttpRequest.Builder mutate = mutatedRequest.mutate();
+                    addHeader(mutate, SecurityConstants.USER_KEY, map.get("accessKey"));
+                    addHeader(mutate, SecurityConstants.DETAILS_USER_ID, map.get("id"));
+                    addHeader(mutate, SecurityConstants.DETAILS_USERNAME, map.get("name"));
+                    ServerWebExchange mutatedExchange = exchange.mutate().request(mutatedRequest).build();
+                    return ServerRequest.create(mutatedExchange, messageReaders).bodyToMono(String.class)
+                            .then(chain.filter(mutatedExchange));
+                }
+            });
+        } else if (request.getMethodValue().equals("GET")) {
+            StringBuilder content = new StringBuilder();
+            MultiValueMap<String, String> params = request.getQueryParams();
+            TreeMap<String, String> treeMap = new TreeMap<>();
+            params.forEach((k, v) -> {
+                treeMap.put(k, v.get(0));
+            });
+            treeMap.forEach((k, v) -> {
+                content.append(v).append("\n");
+            });
+            if (content.length() > 0) {
+                content.delete(content.length() - 1, content.length());
+            }
+
+            String contentmd5 = toMD5Base64(content.toString());
+            if (!contentmd5.equals(acl.getContentmd5())) {
+                return unauthorizedResponse(exchange, "conmentmd5校验失败");
+            }
+            if (!calculateHMAC(map.get("secretKey"), contentmd5 + "\n" + acl.getRequestdate()).equals(acl.getHmac())) {
+                return unauthorizedResponse(exchange, "hmac校验失败");
+            }
+            ServerHttpRequest.Builder mutate = request.mutate();
+            addHeader(mutate, SecurityConstants.USER_KEY, map.get("accessKey"));
+            addHeader(mutate, SecurityConstants.DETAILS_USER_ID, map.get("id"));
+            addHeader(mutate, SecurityConstants.DETAILS_USERNAME, map.get("name"));
+            return chain.filter(exchange.mutate().request(mutate.build()).build());
+        } else {
+            return unauthorizedResponse(exchange, "不支持的请求方式");
+        }
+    }
+
+    private OpenApiAclHeaders getAclHeaders(HttpHeaders headers) {
+        OpenApiAclHeaders acl = new OpenApiAclHeaders();
+        acl.setAccesskey(headers.getFirst("accesskey"));
+        acl.setHmac(headers.getFirst("hmac"));
+        acl.setRequestdate(headers.getFirst("requestdate"));
+        acl.setContentmd5(headers.getFirst("contentmd5"));
+        return acl;
+    }
+
+    //contentmd5计算方法
+    private static String toMD5Base64(String input) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("MD5");
+            md.update(input.getBytes());
+            byte[] digest = md.digest();
+            return new String(Base64.encodeBase64(digest));
+        } catch (Exception e) {
+            throw new ServiceException("contentmd5计算出错：" + e.getMessage(), 401);
+        }
+    }
+
+    //hmac计算方法
+    private static String calculateHMAC(String secret, String data) {
+        try {
+            SecretKeySpec secretKeySpec = new SecretKeySpec(secret.getBytes(), "HmacSHA1");
+            Mac mac = Mac.getInstance("HmacSHA1");
+            mac.init(secretKeySpec);
+            byte[] rawHmac = mac.doFinal(data.getBytes());
+            return new String(Base64.encodeBase64(rawHmac));
+        } catch (Exception e) {
+            throw new ServiceException("hmac计算出错：" + e.getMessage(), 401);
+        }
     }
 }
